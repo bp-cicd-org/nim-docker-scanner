@@ -1,0 +1,198 @@
+name: Scan Docker Images and Hosted NIMs
+
+on:
+  workflow_call:
+    inputs:
+      exclude-dirs:
+        description: 'Comma-separated list of directories to exclude from scanning'
+        required: false
+        type: string
+        default: ''
+      resolve-latest:
+        description: 'Resolve latest Docker tags to actual digests'
+        required: false
+        type: boolean
+        default: true
+      scan-docker-images:
+        description: 'Enable Docker image scanning'
+        required: false
+        type: boolean
+        default: true
+      scan-hosted-nim:
+        description: 'Enable hosted NIM endpoint scanning'
+        required: false
+        type: boolean
+        default: true
+      nvcf-config-repo:
+        description: 'NVCF API Gateway config repository URL'
+        required: false
+        type: string
+        default: 'https://github.com/bp-cicd-org/nvcf-api-gateway-config-prd.git'
+      nvcf-config-file:
+        description: 'NVCF config YAML file name'
+        required: false
+        type: string
+        default: 'nvcf-api-gateway-prd.yaml'
+    secrets:
+      NVIDIA_API_KEY:
+        description: 'NVIDIA API key for nvcr.io access'
+        required: false
+      NVCF_CONFIG_ON_GITHUB_TOKEN:
+        description: 'GitHub token for accessing NVCF config repository'
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      exclude-dirs:
+        description: 'Comma-separated list of directories to exclude from scanning'
+        required: false
+        type: string
+        default: ''
+      resolve-latest:
+        description: 'Resolve latest Docker tags to actual digests'
+        required: false
+        type: boolean
+        default: true
+      scan-docker-images:
+        description: 'Enable Docker image scanning'
+        required: false
+        type: boolean
+        default: true
+      scan-hosted-nim:
+        description: 'Enable hosted NIM endpoint scanning'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  check-secrets:
+    runs-on: ubuntu-latest
+    outputs:
+      has-nvidia-api-key: ${{ steps.check.outputs.has-nvidia-api-key }}
+      has-nvcf-token: ${{ steps.check.outputs.has-nvcf-token }}
+    steps:
+      - name: Check secrets availability
+        id: check
+        run: |
+          if [ -n "${{ secrets.NVIDIA_API_KEY }}" ]; then
+            echo "has-nvidia-api-key=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-nvidia-api-key=false" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "${{ secrets.NVCF_CONFIG_ON_GITHUB_TOKEN }}" ]; then
+            echo "has-nvcf-token=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-nvcf-token=false" >> $GITHUB_OUTPUT
+          fi
+
+  scan:
+    runs-on: ubuntu-latest
+    needs: check-secrets
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout scanner scripts
+        uses: actions/checkout@v4
+        with:
+          repository: bp-cicd-org/nim-docker-scanner
+          path: .nim-docker-scanner
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pyyaml -q
+
+      - name: Login to nvcr.io
+        if: inputs.scan-docker-images && inputs.resolve-latest && needs.check-secrets.outputs.has-nvidia-api-key == 'true'
+        run: |
+          echo "${{ secrets.NVIDIA_API_KEY }}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+      - name: Scan Docker Images
+        if: inputs.scan-docker-images
+        env:
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          REPO_SAFE_NAME=$(echo "$REPO_NAME" | tr '/' '-')
+          REPORT_FILENAME="docker-image-report-${REPO_SAFE_NAME}-${{ github.run_id }}.json"
+          
+          EXCLUDE_ARGS=""
+          if [ -n "${{ inputs.exclude-dirs }}" ]; then
+            IFS=',' read -ra DIRS <<< "${{ inputs.exclude-dirs }}"
+            for dir in "${DIRS[@]}"; do
+              EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude-dirs $dir"
+            done
+          fi
+          
+          python3 .nim-docker-scanner/scripts/scan_docker_images.py \
+            --repo-root . \
+            --workflow-dir .github/workflows \
+            $EXCLUDE_ARGS \
+            --output "$REPORT_FILENAME" \
+            --run-id "${{ github.run_id }}" \
+            --run-number "${{ github.run_number }}" \
+            --repo-name "$REPO_NAME"
+          
+          echo "DOCKER_REPORT_FILENAME=$REPORT_FILENAME" >> $GITHUB_ENV
+
+      - name: Upload Docker Image Report
+        if: inputs.scan-docker-images
+        uses: actions/upload-artifact@v4
+        env:
+          REPO_SAFE_NAME: ${{ github.repository_owner }}-${{ github.event.repository.name }}
+        with:
+          name: docker-image-report-${{ env.REPO_SAFE_NAME }}-${{ github.run_id }}
+          path: docker-image-report-*-${{ github.run_id }}.json
+          retention-days: 90
+
+      - name: Scan Hosted NIM Endpoints
+        if: inputs.scan-hosted-nim && needs.check-secrets.outputs.has-nvcf-token == 'true'
+        env:
+          REPO_NAME: ${{ github.repository }}
+          NVCF_CONFIG_ON_GITHUB_TOKEN: ${{ secrets.NVCF_CONFIG_ON_GITHUB_TOKEN }}
+        run: |
+          REPO_SAFE_NAME=$(echo "$REPO_NAME" | tr '/' '-')
+          NIM_REPORT_FILENAME="hosted-nim-report-${REPO_SAFE_NAME}-${{ github.run_id }}.json"
+          
+          EXCLUDE_ARGS=""
+          if [ -n "${{ inputs.exclude-dirs }}" ]; then
+            IFS=',' read -ra DIRS <<< "${{ inputs.exclude-dirs }}"
+            for dir in "${DIRS[@]}"; do
+              EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude-dirs $dir"
+            done
+          fi
+          
+          python3 .nim-docker-scanner/scripts/scan_hosted_nim.py \
+            --repo-root . \
+            --workflow-dir .github/workflows \
+            --nvcf-config-repo "${{ inputs.nvcf-config-repo || 'https://github.com/bp-cicd-org/nvcf-api-gateway-config-prd.git' }}" \
+            --nvcf-config-file "${{ inputs.nvcf-config-file || 'nvcf-api-gateway-prd.yaml' }}" \
+            $EXCLUDE_ARGS \
+            --output "$NIM_REPORT_FILENAME" \
+            --run-id "${{ github.run_id }}" \
+            --run-number "${{ github.run_number }}" \
+            --repo-name "$REPO_NAME"
+          
+          echo "NIM_REPORT_FILENAME=$NIM_REPORT_FILENAME" >> $GITHUB_ENV
+
+      - name: Upload Hosted NIM Report
+        if: inputs.scan-hosted-nim && needs.check-secrets.outputs.has-nvcf-token == 'true'
+        uses: actions/upload-artifact@v4
+        env:
+          REPO_SAFE_NAME: ${{ github.repository_owner }}-${{ github.event.repository.name }}
+        with:
+          name: hosted-nim-report-${{ env.REPO_SAFE_NAME }}-${{ github.run_id }}
+          path: hosted-nim-report-*-${{ github.run_id }}.json
+          retention-days: 90
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf .nim-docker-scanner
+          docker logout nvcr.io 2>/dev/null || true
